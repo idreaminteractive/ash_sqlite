@@ -346,8 +346,12 @@ defmodule AshSqlite.MigrationGeneratorTest do
       file_contents = File.read!(file2)
 
       # Should use drop + recreate instead of ALTER INDEX (which is PostgreSQL-only)
-      assert file_contents =~ ~S|drop_if_exists unique_index(:posts, [:title], name: "posts_title_index")|
-      assert file_contents =~ ~S|create unique_index(:posts, [:title], name: "titles_r_unique_dawg")|
+      assert file_contents =~
+               ~S|drop_if_exists unique_index(:posts, [:title], name: "posts_title_index")|
+
+      assert file_contents =~
+               ~S|create unique_index(:posts, [:title], name: "titles_r_unique_dawg")|
+
       refute file_contents =~ "ALTER INDEX"
     end
 
@@ -1622,6 +1626,178 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert file_contents =~ "CREATE TABLE"
       assert file_contents =~ "posts_migration_temp"
       assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
+    end
+
+    test "rebuild with nullability change on column with default uses COALESCE", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        sqlite do
+          migration_defaults(title: "\"hey hey\"")
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Change to NOT NULL — triggers rebuild, and existing NULLs need COALESCE
+      defposts do
+        sqlite do
+          migration_defaults(title: "\"hey hey\"")
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: false)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should generate a rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+
+      # The INSERT ... SELECT should use COALESCE for the nullable-to-not-null transition
+      assert file_contents =~ "COALESCE"
+      assert file_contents =~ "'hey hey'"
+    end
+
+    test "rebuild with new NOT NULL column with default includes default in SELECT", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Add a NOT NULL column with a default AND change nullability on title (triggers rebuild)
+      defposts do
+        sqlite do
+          migration_defaults(thing: "\"hey hey\"")
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: false)
+          attribute(:thing, :string, allow_nil?: false)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should generate a rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+
+      # New column "thing" should appear in INSERT with its default value in SELECT
+      assert file_contents =~ "thing"
+      assert file_contents =~ "'hey hey'"
+    end
+
+    test "rebuild uses COALESCE with type zero value when no migration_default is configured", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+          attribute(:thing, :string, allow_nil?: true)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Change "thing" to NOT NULL with a runtime-only default (no migration_defaults)
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+          attribute(:thing, :string, allow_nil?: false)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should generate a rebuild (nullability change)
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+
+      # Should use COALESCE with a type-appropriate zero value for existing NULLs
+      assert file_contents =~ "COALESCE"
+      # text type zero value is ''
+      assert file_contents =~ ~S|COALESCE(\"thing\", '')|
     end
   end
 end
