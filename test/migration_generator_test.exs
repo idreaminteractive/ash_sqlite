@@ -311,7 +311,7 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert [_] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
     end
 
-    test "when renaming an index, it is properly renamed", %{
+    test "when renaming an index, it is properly renamed with drop + recreate", %{
       snapshot_path: snapshot_path,
       migration_path: migration_path
     } do
@@ -343,8 +343,12 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert [_file1, file2] =
                Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
 
-      assert File.read!(file2) =~
-               ~S[ALTER INDEX posts_title_index RENAME TO titles_r_unique_dawg]
+      file_contents = File.read!(file2)
+
+      # Should use drop + recreate instead of ALTER INDEX (which is PostgreSQL-only)
+      assert file_contents =~ ~S|drop_if_exists unique_index(:posts, [:title], name: "posts_title_index")|
+      assert file_contents =~ ~S|create unique_index(:posts, [:title], name: "titles_r_unique_dawg")|
+      refute file_contents =~ "ALTER INDEX"
     end
 
     test "when adding a field, it adds the field", %{
@@ -409,10 +413,11 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert File.read!(file2) =~ ~S[rename table(:posts), :title, to: :name]
     end
 
-    test "when renaming a field, it asks if you are renaming it, and adds it if you aren't", %{
-      snapshot_path: snapshot_path,
-      migration_path: migration_path
-    } do
+    test "when renaming a field, it asks if you are renaming it, and generates a rebuild if you aren't (column in index)",
+         %{
+           snapshot_path: snapshot_path,
+           migration_path: migration_path
+         } do
       defposts do
         attributes do
           uuid_primary_key(:id)
@@ -435,8 +440,13 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert [_file1, file2] =
                Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
 
-      assert File.read!(file2) =~
-               ~S[add :name, :text, null: false]
+      file_contents = File.read!(file2)
+
+      # Removing :title (which is in a unique index) triggers a table rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ ~S[CREATE TABLE]
+      assert file_contents =~ ~S[posts_migration_temp]
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
     end
 
     test "when renaming a field, it asks which field you are renaming it to, and renames it if you are",
@@ -472,7 +482,7 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert File.read!(file2) =~ ~S[rename table(:posts), :subject, to: :title]
     end
 
-    test "when renaming a field, it asks which field you are renaming it to, and adds it if you arent",
+    test "when renaming a field, it asks which field you are renaming it to, and generates rebuild if you arent (column in index)",
          %{snapshot_path: snapshot_path, migration_path: migration_path} do
       defposts do
         attributes do
@@ -497,8 +507,13 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert [_file1, file2] =
                Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
 
-      assert File.read!(file2) =~
-               ~S[add :subject, :text, null: false]
+      file_contents = File.read!(file2)
+
+      # Removing :title (which is in a unique index) triggers a table rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ ~S[CREATE TABLE]
+      assert file_contents =~ ~S[posts_migration_temp]
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
     end
 
     test "when an attribute exists only on some of the resources that use the same table, it isn't marked as null: false",
@@ -686,7 +701,7 @@ defmodule AshSqlite.MigrationGeneratorTest do
                ~S[references(:posts, column: :id, name: "posts_post_id_fkey", type: :text)]
     end
 
-    test "when modified, the foreign key is dropped before modification", %{
+    test "modifying a foreign key generates a table rebuild migration", %{
       snapshot_path: snapshot_path,
       migration_path: migration_path
     } do
@@ -751,20 +766,24 @@ defmodule AshSqlite.MigrationGeneratorTest do
                |> Enum.at(1)
                |> File.read!()
 
-      assert file =~
-               ~S[references(:posts, column: :id, name: "special_post_fkey", type: :uuid, on_delete: :delete_all, on_update: :update_all)]
+      # Should generate a table rebuild instead of raising
+      assert file =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file =~ ~S[CREATE TABLE]
+      assert file =~ ~S[posts_migration_temp]
+      assert file =~ ~S[DROP TABLE]
+      assert file =~ ~S[RENAME TO]
+      assert file =~ ~S[PRAGMA foreign_keys = ON]
 
-      assert file =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
-      assert file =~ ~S[posts_post_id_fkey]
+      # Should NOT contain the old raise message
+      refute file =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
 
+      # Both up and down should contain rebuild sequences
       assert [_, down_code] = String.split(file, "def down do")
-
-      assert down_code =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
-      assert down_code =~ ~S[special_post_fkey]
-      assert down_code =~ ~S[references(:posts]
+      assert down_code =~ ~S[PRAGMA foreign_keys = OFF]
+      assert down_code =~ ~S[PRAGMA foreign_keys = ON]
     end
 
-    test "dropping foreign keys raises with guidance since SQLite doesn't support it", %{
+    test "modifying a foreign key constraint generates a table rebuild", %{
       snapshot_path: snapshot_path,
       migration_path: migration_path
     } do
@@ -827,16 +846,23 @@ defmodule AshSqlite.MigrationGeneratorTest do
 
       file_contents = File.read!(file2)
 
-      # Up migration should raise with helpful message
-      assert file_contents =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
-      assert file_contents =~ ~S[posts_post_id_fkey]
-      assert file_contents =~ ~S[https://www.techonthenet.com/sqlite/foreign_keys/drop.php]
+      # Up migration should generate a table rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ ~S[CREATE TABLE]
+      assert file_contents =~ ~S[posts_migration_temp]
+      assert file_contents =~ ~S[INSERT INTO]
+      assert file_contents =~ ~S[DROP TABLE]
+      assert file_contents =~ ~S[RENAME TO]
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
 
-      # Down migration should also raise
+      # Should NOT contain the old raise message
+      refute file_contents =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
+
+      # Down migration should also contain rebuild
       [_, down_code] = String.split(file_contents, "def down do")
-
-      assert down_code =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
-      assert down_code =~ ~S[new_post_fkey]
+      assert down_code =~ ~S[PRAGMA foreign_keys = OFF]
+      assert down_code =~ ~S[CREATE TABLE]
+      assert down_code =~ ~S[PRAGMA foreign_keys = ON]
     end
   end
 
@@ -992,7 +1018,7 @@ defmodule AshSqlite.MigrationGeneratorTest do
       :ok
     end
 
-    test "when changing the primary key, it changes properly", %{
+    test "when changing the primary key, it generates a table rebuild", %{
       snapshot_path: snapshot_path,
       migration_path: migration_path
     } do
@@ -1038,18 +1064,16 @@ defmodule AshSqlite.MigrationGeneratorTest do
 
       file = File.read!(file2)
 
-      assert [before_index_drop, after_index_drop] =
-               String.split(file, ~S[drop constraint("posts", "posts_pkey")], parts: 2)
+      # FK changes now trigger a table rebuild instead of raising
+      assert file =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file =~ ~S[CREATE TABLE]
+      assert file =~ ~S[comments_migration_temp]
+      assert file =~ ~S[DROP TABLE]
+      assert file =~ ~S[RENAME TO]
+      assert file =~ ~S[PRAGMA foreign_keys = ON]
 
-      assert before_index_drop =~
-               ~S[raise "SQLite does not support dropping foreign key constraints.]
-
-      assert before_index_drop =~ ~S[comments_post_id_fkey]
-
-      assert after_index_drop =~ ~S[modify :id, :uuid, null: true, primary_key: false]
-
-      assert after_index_drop =~
-               ~S[modify :post_id, references(:posts, column: :id, name: "comments_post_id_fkey", type: :uuid)]
+      # Should NOT contain the old raise message
+      refute file =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
     end
   end
 
@@ -1120,6 +1144,484 @@ defmodule AshSqlite.MigrationGeneratorTest do
       # Down migration
       assert File.read!(file2) =~ ~S[rename table(:posts), :creator2_id, to: :creator_id]
       assert File.read!(file2) =~ ~S[rename table(:posts), :contributer2_id, to: :contributer_id]
+    end
+  end
+
+  describe "table rebuild migrations" do
+    setup do: :ok
+
+    test "type change on a column generates a table rebuild", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        sqlite do
+          migration_types(title: :binary)
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Up migration should contain rebuild sequence
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ "CREATE TABLE"
+      assert file_contents =~ "posts_migration_temp"
+      assert file_contents =~ "INSERT INTO"
+      assert file_contents =~ ~S[DROP TABLE "posts"]
+      assert file_contents =~ ~S[RENAME TO "posts"]
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
+
+      # Down should also contain rebuild
+      [_, down_code] = String.split(file_contents, "def down do")
+      assert down_code =~ ~S[PRAGMA foreign_keys = OFF]
+      assert down_code =~ "CREATE TABLE"
+      assert down_code =~ ~S[PRAGMA foreign_keys = ON]
+    end
+
+    test "nullability change generates a table rebuild", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: false)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ "CREATE TABLE"
+      assert file_contents =~ "posts_migration_temp"
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
+
+      # Down should also contain rebuild
+      [_, down_code] = String.split(file_contents, "def down do")
+      assert down_code =~ ~S[PRAGMA foreign_keys = OFF]
+      assert down_code =~ ~S[PRAGMA foreign_keys = ON]
+    end
+
+    test "adding a column without other changes does NOT generate a rebuild", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+          attribute(:body, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should use standard alter table, not rebuild
+      assert file_contents =~ "alter table(:posts)"
+      assert file_contents =~ "add :body, :text"
+      refute file_contents =~ "PRAGMA foreign_keys"
+      refute file_contents =~ "posts_migration_temp"
+    end
+
+    test "removing a column with no FK and no index uses simple remove", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+          attribute(:body, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should use simple remove (no FK, not in any index)
+      assert file_contents =~ "remove :body"
+      refute file_contents =~ "PRAGMA foreign_keys"
+      refute file_contents =~ "posts_migration_temp"
+    end
+
+    test "removing a column that appears in a unique index generates a table rebuild", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defdomain([Post])
+
+      send(self(), {:mix_shell_input, :yes?, false})
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should generate a rebuild since :title is in a unique index
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ "CREATE TABLE"
+      assert file_contents =~ "posts_migration_temp"
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
+    end
+
+    test "RenameUniqueIndex generates drop + recreate, not ALTER INDEX", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        sqlite do
+          identity_index_names(title: "posts_foo_index")
+        end
+
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        sqlite do
+          identity_index_names(title: "posts_bar_index")
+        end
+
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      assert file_contents =~ ~S|drop_if_exists unique_index(:posts|
+      assert file_contents =~ ~S|posts_foo_index|
+      assert file_contents =~ ~S|create unique_index(:posts|
+      assert file_contents =~ ~S|posts_bar_index|
+      refute file_contents =~ "ALTER INDEX"
+    end
+
+    test "table rebuild recreates all indexes", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: true)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Change nullability to trigger rebuild
+      defposts do
+        identities do
+          identity(:title, [:title])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string, allow_nil?: false)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Should contain rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+
+      # Should recreate unique indexes after the rebuild
+      assert file_contents =~ ~S|CREATE UNIQUE INDEX "posts_title_index"|
+
+      # Should recreate custom indexes after the rebuild
+      assert file_contents =~ ~S|CREATE INDEX "posts_id_index"|
+      assert file_contents =~ ~S|CREATE UNIQUE INDEX "test_unique_index"|
+    end
+
+    test "removing a column that has a FK generates a table rebuild", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:title, :string)
+        end
+      end
+
+      defposts Post2 do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:name, :string)
+        end
+
+        relationships do
+          belongs_to(:post, Post)
+        end
+      end
+
+      defdomain([Post, Post2])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Remove the belongs_to relationship (which removes the FK column)
+      defposts Post2 do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:name, :string)
+        end
+      end
+
+      defdomain([Post, Post2])
+
+      send(self(), {:mix_shell_input, :yes?, false})
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_file1, file2] =
+               Enum.sort(Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs"))
+
+      file_contents = File.read!(file2)
+
+      # Removing a column with a FK should trigger rebuild
+      assert file_contents =~ ~S[PRAGMA foreign_keys = OFF]
+      assert file_contents =~ "CREATE TABLE"
+      assert file_contents =~ "posts_migration_temp"
+      assert file_contents =~ ~S[PRAGMA foreign_keys = ON]
     end
   end
 end

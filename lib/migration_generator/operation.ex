@@ -73,31 +73,24 @@ defmodule AshSqlite.MigrationGenerator.Operation do
     def reference_type(%{type: type}, _) do
       type
     end
-  end
 
-  defmodule CreateTable do
-    @moduledoc false
-    defstruct [:table, :multitenancy, :old_multitenancy, options: []]
-  end
+    @doc false
+    def column_def(attribute, multitenancy) do
+      do_column_def(attribute, multitenancy)
+    end
 
-  defmodule AddAttribute do
-    @moduledoc false
-    defstruct [:attribute, :table, :multitenancy, :old_multitenancy]
-
-    import Helper
-
-    def up(%{
-          multitenancy: %{strategy: :attribute, attribute: source_attribute},
-          attribute:
-            %{
-              references:
-                %{
-                  table: table,
-                  destination_attribute: reference_attribute,
-                  multitenancy: %{strategy: :attribute, attribute: destination_attribute}
-                } = reference
-            } = attribute
-        }) do
+    # Multitenancy reference
+    defp do_column_def(
+           %{
+             references:
+               %{
+                 table: table,
+                 destination_attribute: reference_attribute,
+                 multitenancy: %{strategy: :attribute, attribute: destination_attribute}
+               } = reference
+           } = attribute,
+           %{strategy: :attribute, attribute: source_attribute}
+         ) do
       with_match =
         if destination_attribute != reference_attribute do
           "with: [#{as_atom(source_attribute)}: :#{as_atom(destination_attribute)}], match: :full"
@@ -128,16 +121,17 @@ defmodule AshSqlite.MigrationGenerator.Operation do
       |> join()
     end
 
-    def up(%{
-          attribute:
-            %{
-              references:
-                %{
-                  table: table,
-                  destination_attribute: destination_attribute
-                } = reference
-            } = attribute
-        }) do
+    # Plain reference
+    defp do_column_def(
+           %{
+             references:
+               %{
+                 table: table,
+                 destination_attribute: destination_attribute
+               } = reference
+           } = attribute,
+           _multitenancy
+         ) do
       size =
         if attribute[:size] do
           "size: #{attribute[:size]}"
@@ -162,7 +156,8 @@ defmodule AshSqlite.MigrationGenerator.Operation do
       |> join()
     end
 
-    def up(%{attribute: %{type: :bigint, default: "nil", generated?: true} = attribute}) do
+    # Bigserial
+    defp do_column_def(%{type: :bigint, default: "nil", generated?: true} = attribute, _multitenancy) do
       [
         "add #{inspect(attribute.source)}",
         ":bigserial",
@@ -172,7 +167,8 @@ defmodule AshSqlite.MigrationGenerator.Operation do
       |> join()
     end
 
-    def up(%{attribute: %{type: :integer, default: "nil", generated?: true} = attribute}) do
+    # Serial
+    defp do_column_def(%{type: :integer, default: "nil", generated?: true} = attribute, _multitenancy) do
       [
         "add #{inspect(attribute.source)}",
         ":serial",
@@ -182,7 +178,8 @@ defmodule AshSqlite.MigrationGenerator.Operation do
       |> join()
     end
 
-    def up(%{attribute: attribute}) do
+    # Plain attribute
+    defp do_column_def(attribute, _multitenancy) do
       size =
         if attribute[:size] do
           "size: #{attribute[:size]}"
@@ -197,6 +194,20 @@ defmodule AshSqlite.MigrationGenerator.Operation do
         maybe_add_primary_key(attribute.primary_key?)
       ]
       |> join()
+    end
+  end
+
+  defmodule CreateTable do
+    @moduledoc false
+    defstruct [:table, :multitenancy, :old_multitenancy, options: []]
+  end
+
+  defmodule AddAttribute do
+    @moduledoc false
+    defstruct [:attribute, :table, :multitenancy, :old_multitenancy]
+
+    def up(%{attribute: attribute, multitenancy: multitenancy}) do
+      Helper.column_def(attribute, multitenancy)
     end
 
     def down(
@@ -217,23 +228,10 @@ defmodule AshSqlite.MigrationGenerator.Operation do
 
   defmodule AlterDeferrability do
     @moduledoc false
+    # SQLite does not support deferrable constraints. This is a no-op.
     defstruct [:table, :references, :direction, no_phase: true]
 
-    def up(%{direction: :up, table: table, references: %{name: name, deferrable: true}}) do
-      "execute(\"ALTER TABLE #{table} alter CONSTRAINT #{name} DEFERRABLE INITIALLY IMMEDIATE\");"
-    end
-
-    def up(%{direction: :up, table: table, references: %{name: name, deferrable: :initially}}) do
-      "execute(\"ALTER TABLE #{table} alter CONSTRAINT #{name} DEFERRABLE INITIALLY DEFERRED\");"
-    end
-
-    def up(%{direction: :up, table: table, references: %{name: name}}) do
-      "execute(\"ALTER TABLE #{table} alter CONSTRAINT #{name} NOT DEFERRABLE\");"
-    end
-
     def up(_), do: ""
-
-    def down(%{direction: :down} = data), do: up(%{data | direction: :up})
     def down(_), do: ""
   end
 
@@ -367,34 +365,13 @@ defmodule AshSqlite.MigrationGenerator.Operation do
 
   defmodule DropForeignKey do
     @moduledoc false
-    # We only run this migration in one direction, based on the input
-    # This is because the creation of a foreign key is handled by `references/3`
-    # We only need to drop it before altering an attribute with `references/3`
+    # DropForeignKey operations are absorbed into Phase.RebuildTable at the
+    # group_into_phases stage. The rebuild handles FK changes via CREATE TABLE
+    # with the new schema. These up/down implementations are no-ops.
     defstruct [:attribute, :table, :multitenancy, :direction, no_phase: true]
 
-    def up(%{table: table, attribute: %{references: reference}, direction: :up}) do
-      ~s[raise "SQLite does not support dropping foreign key constraints. " <>
-          "You will need to manually recreate the `#{table}` table without the `#{reference.name}` constraint. " <>
-          "See https://www.techonthenet.com/sqlite/foreign_keys/drop.php for guidance."]
-    end
-
-    def up(_) do
-      ""
-    end
-
-    def down(%{
-          table: table,
-          attribute: %{references: reference},
-          direction: :down
-        }) do
-      ~s[raise "SQLite does not support dropping foreign key constraints. " <>
-          "You will need to manually recreate the `#{table}` table without the `#{reference.name}` constraint. " <>
-          "See https://www.techonthenet.com/sqlite/foreign_keys/drop.php for guidance."]
-    end
-
-    def down(_) do
-      ""
-    end
+    def up(_), do: ""
+    def down(_), do: ""
   end
 
   defmodule RenameAttribute do
@@ -432,7 +409,7 @@ defmodule AshSqlite.MigrationGenerator.Operation do
 
   defmodule RemoveAttribute do
     @moduledoc false
-    defstruct [:attribute, :table, :multitenancy, :old_multitenancy, commented?: true]
+    defstruct [:attribute, :table, :multitenancy, :old_multitenancy, commented?: false]
 
     def up(%{attribute: attribute, commented?: true}) do
       """
@@ -725,26 +702,45 @@ defmodule AshSqlite.MigrationGenerator.Operation do
       no_phase: true
     ]
 
-    def up(%{
-          old_identity: %{index_name: old_index_name, name: old_name},
-          new_identity: %{index_name: new_index_name},
-          table: table
-        }) do
-      old_index_name = old_index_name || "#{table}_#{old_name}_index"
+    import Helper
 
-      "execute(\"ALTER INDEX #{old_index_name} " <>
-        "RENAME TO #{new_index_name}\")\n"
+    def up(%{
+          old_identity: old,
+          new_identity: new,
+          table: table,
+          multitenancy: multitenancy
+        }) do
+      old_name = old.index_name || "#{table}_#{old.name}_index"
+      keys = index_keys(new, multitenancy)
+
+      "drop_if_exists unique_index(:#{as_atom(table)}, [#{keys}], name: \"#{old_name}\")\n" <>
+        "create unique_index(:#{as_atom(table)}, [#{keys}], name: \"#{new.index_name}\")\n"
     end
 
     def down(%{
-          old_identity: %{index_name: old_index_name, name: old_name},
-          new_identity: %{index_name: new_index_name},
-          table: table
+          old_identity: old,
+          new_identity: new,
+          table: table,
+          multitenancy: multitenancy
         }) do
-      old_index_name = old_index_name || "#{table}_#{old_name}_index"
+      old_name = old.index_name || "#{table}_#{old.name}_index"
+      keys = index_keys(old, multitenancy)
 
-      "execute(\"ALTER INDEX #{new_index_name} " <>
-        "RENAME TO #{old_index_name}\")\n"
+      "drop_if_exists unique_index(:#{as_atom(table)}, [#{keys}], name: \"#{new.index_name}\")\n" <>
+        "create unique_index(:#{as_atom(table)}, [#{keys}], name: \"#{old_name}\")\n"
+    end
+
+    defp index_keys(identity, multitenancy) do
+      keys =
+        case multitenancy do
+          %{strategy: :attribute, attribute: mt_attr} when not is_nil(mt_attr) ->
+            [mt_attr | identity.keys]
+
+          _ ->
+            identity.keys
+        end
+
+      Enum.map_join(keys, ", ", &inspect/1)
     end
   end
 

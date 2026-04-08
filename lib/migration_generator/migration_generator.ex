@@ -334,6 +334,26 @@ defmodule AshSqlite.MigrationGenerator do
 
       snapshots = Enum.map(snapshots_with_operations, &elem(&1, 0))
 
+      # Build snapshots_by_table map for rebuild detection
+      snapshots_by_table =
+        Map.new(deduped, fn {new_snapshot, old_snapshot} ->
+          old =
+            old_snapshot ||
+              %{
+                attributes: [],
+                identities: [],
+                custom_indexes: [],
+                custom_statements: [],
+                table: new_snapshot.table,
+                repo: new_snapshot.repo,
+                base_filter: nil,
+                empty?: true,
+                multitenancy: %{attribute: nil, strategy: nil, global: nil}
+              }
+
+          {new_snapshot.table, {old, new_snapshot}}
+        end)
+
       snapshots_with_operations
       |> Enum.flat_map(&elem(&1, 1))
       |> Enum.uniq()
@@ -363,7 +383,7 @@ defmodule AshSqlite.MigrationGenerator do
 
           migration_files =
             operations
-            |> organize_operations
+            |> organize_operations(snapshots_by_table)
             |> build_up_and_down()
             |> migration(repo, opts)
 
@@ -516,13 +536,15 @@ defmodule AshSqlite.MigrationGenerator do
 
   defp add_order_to_operation(op, _), do: op
 
-  defp organize_operations([]), do: []
+  defp organize_operations(operations, snapshots_by_table \\ %{})
 
-  defp organize_operations(operations) do
+  defp organize_operations([], _snapshots_by_table), do: []
+
+  defp organize_operations(operations, snapshots_by_table) do
     operations
     |> sort_operations()
     |> streamline()
-    |> group_into_phases()
+    |> group_into_phases(nil, [], snapshots_by_table)
     |> clean_phases()
   end
 
@@ -1101,12 +1123,12 @@ defmodule AshSqlite.MigrationGenerator do
     streamline(rest, [first | acc])
   end
 
-  defp group_into_phases(ops, current \\ nil, acc \\ [])
+  defp group_into_phases(ops, current, acc, snapshots_by_table)
 
-  defp group_into_phases([], nil, acc), do: Enum.reverse(acc)
+  defp group_into_phases([], nil, acc, _snapshots_by_table), do: Enum.reverse(acc)
 
-  defp group_into_phases([], phase, acc) do
-    phase = %{phase | operations: Enum.reverse(phase.operations)}
+  defp group_into_phases([], phase, acc, snapshots_by_table) do
+    phase = maybe_rebuild_phase(phase, snapshots_by_table)
     Enum.reverse([phase | acc])
   end
 
@@ -1116,7 +1138,8 @@ defmodule AshSqlite.MigrationGenerator do
            | rest
          ],
          nil,
-         acc
+         acc,
+         snapshots_by_table
        ) do
     # this is kind of a hack
     {has_to_be_in_this_phase, rest} =
@@ -1133,59 +1156,90 @@ defmodule AshSqlite.MigrationGenerator do
         options: options,
         operations: has_to_be_in_this_phase
       },
-      acc
+      acc,
+      snapshots_by_table
     )
   end
 
   defp group_into_phases(
          [%Operation.AddAttribute{table: table} = op | rest],
          %{table: table} = phase,
-         acc
+         acc,
+         snapshots_by_table
        ) do
-    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc)
+    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc, snapshots_by_table)
   end
 
   defp group_into_phases(
          [%Operation.AlterAttribute{table: table} = op | rest],
          %Phase.Alter{table: table} = phase,
-         acc
+         acc,
+         snapshots_by_table
        ) do
-    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc)
+    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc, snapshots_by_table)
   end
 
   defp group_into_phases(
          [%Operation.RenameAttribute{table: table} = op | rest],
          %Phase.Alter{table: table} = phase,
-         acc
+         acc,
+         snapshots_by_table
        ) do
-    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc)
+    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc, snapshots_by_table)
   end
 
   defp group_into_phases(
          [%Operation.RemoveAttribute{table: table} = op | rest],
          %{table: table} = phase,
-         acc
+         acc,
+         snapshots_by_table
        ) do
-    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc)
+    group_into_phases(rest, %{phase | operations: [op | phase.operations]}, acc, snapshots_by_table)
   end
 
-  defp group_into_phases([%{no_phase: true} = op | rest], nil, acc) do
-    group_into_phases(rest, nil, [op | acc])
+  defp group_into_phases([%{no_phase: true} = op | rest], nil, acc, snapshots_by_table) do
+    group_into_phases(rest, nil, [op | acc], snapshots_by_table)
   end
 
-  defp group_into_phases([operation | rest], nil, acc) do
+  defp group_into_phases([operation | rest], nil, acc, snapshots_by_table) do
     phase = %Phase.Alter{
       operations: [operation],
       multitenancy: operation.multitenancy,
       table: operation.table
     }
 
-    group_into_phases(rest, phase, acc)
+    group_into_phases(rest, phase, acc, snapshots_by_table)
   end
 
-  defp group_into_phases(operations, phase, acc) do
-    phase = %{phase | operations: Enum.reverse(phase.operations)}
-    group_into_phases(operations, nil, [phase | acc])
+  defp group_into_phases(operations, phase, acc, snapshots_by_table) do
+    phase = maybe_rebuild_phase(phase, snapshots_by_table)
+    group_into_phases(operations, nil, [phase | acc], snapshots_by_table)
+  end
+
+  # Check if an Alter phase should become a RebuildTable phase
+  defp maybe_rebuild_phase(%Phase.Alter{} = phase, snapshots_by_table) do
+    finalized_ops = Enum.reverse(phase.operations)
+
+    case Map.get(snapshots_by_table, phase.table) do
+      {old_snap, new_snap} ->
+        if Enum.any?(finalized_ops, &requires_rebuild?(&1, old_snap)) do
+          %Phase.RebuildTable{
+            table: phase.table,
+            multitenancy: phase.multitenancy,
+            old_snapshot: old_snap,
+            new_snapshot: new_snap
+          }
+        else
+          %{phase | operations: finalized_ops}
+        end
+
+      _ ->
+        %{phase | operations: finalized_ops}
+    end
+  end
+
+  defp maybe_rebuild_phase(phase, _snapshots_by_table) do
+    %{phase | operations: Enum.reverse(phase.operations)}
   end
 
   defp sort_operations(ops, acc \\ [])
@@ -1520,6 +1574,37 @@ defmodule AshSqlite.MigrationGenerator do
        do: true
 
   defp after?(_, _), do: false
+
+  # Type change, nullability change, default change, or FK change on existing column
+  defp requires_rebuild?(%Operation.AlterAttribute{old_attribute: old, new_attribute: new}, _) do
+    old.type != new.type or
+      old.allow_nil? != new.allow_nil? or
+      old.default != new.default or
+      Map.get(old, :references) != Map.get(new, :references)
+  end
+
+  # FK drop always requires rebuild
+  defp requires_rebuild?(%Operation.DropForeignKey{}, _), do: true
+
+  # Column removal requires rebuild if the column has a FK or appears in any index
+  defp requires_rebuild?(%Operation.RemoveAttribute{attribute: attr}, old_snapshot) do
+    has_fk? = not is_nil(Map.get(attr, :references))
+
+    in_unique_index? =
+      Enum.any?(Map.get(old_snapshot, :identities, []), fn identity ->
+        to_string(attr.source) in Enum.map(identity.keys, &to_string/1)
+      end)
+
+    in_custom_index? =
+      Enum.any?(Map.get(old_snapshot, :custom_indexes, []), fn index ->
+        to_string(attr.source) in Enum.map(index.fields, &to_string/1)
+      end)
+
+    has_fk? or in_unique_index? or in_custom_index?
+  end
+
+  # Everything else does not require rebuild
+  defp requires_rebuild?(_, _), do: false
 
   defp fetch_operations(snapshots, opts) do
     snapshots
@@ -1918,8 +2003,7 @@ defmodule AshSqlite.MigrationGenerator do
       Enum.map(attributes_to_remove, fn attribute ->
         %Operation.RemoveAttribute{
           attribute: attribute,
-          table: snapshot.table,
-          commented?: !opts.drop_columns
+          table: snapshot.table
         }
       end)
 
