@@ -9,7 +9,7 @@ defmodule AshSqlite.MixProject do
   The SQLite data layer for Ash Framework.
   """
 
-  @version "0.2.16"
+  @version "0.2.17"
 
   def project do
     [
@@ -87,6 +87,7 @@ defmodule AshSqlite.MixProject do
         {"README.md", title: "Home"},
         "documentation/tutorials/getting-started-with-ash-sqlite.md",
         "documentation/topics/about-ash-sqlite/what-is-ash-sqlite.md",
+        "documentation/topics/about-ash-sqlite/transactions.md",
         "documentation/topics/resources/references.md",
         "documentation/topics/resources/polymorphic-resources.md",
         "documentation/topics/development/migrations-and-tasks.md",
